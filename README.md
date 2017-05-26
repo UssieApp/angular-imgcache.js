@@ -54,7 +54,14 @@ You can override imgcache.js default options in Angulars config section.
     // This might be useful to disable it to get rid of CORS issues when
     // developing cordova Applications using a browser.
     ImgCacheProvider.disableCache(true);
-
+    
+    // ImgCache supports a retry directive to give the calling app the chance
+    // to respond to network outages, invalid urls, etc. The provider should
+    // return a function that takes 2 parameters: the src url and error object
+    // and returns a promise with either the src url to retry in the success,
+    // or a url to replace it with in the reject.
+    ImgCacheProvider.retryCallbackProvider('ImageRetry');
+    
     ...
 
 });
