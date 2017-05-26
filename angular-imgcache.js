@@ -2,100 +2,181 @@
 angular.module('ImgCache', [])
 
 .provider('ImgCache', function() {
+
     ImgCache.$init = function() {
         ImgCache.init(function() {
-            if (!ImgCache.options.cacheDisabled) {
-                ImgCache.$deferred.resolve();
-            } else {
-                ImgCache.$deferred.reject();
-            }
+            var $def = ImgCache.$deferred;
+            if (!ImgCache.options.cacheDisabled) { $def.resolve(); } else { $def.reject(); }
         }, function() {
             ImgCache.$deferred.reject();
         });
     };
 
-    this.manualInit = false;
+    angular.extend(this, {
+        manualInit: false,
 
-    this.setOptions = function(options) {
-        angular.extend(ImgCache.options, options);
-    };
+        options: ImgCache.options,
 
-    this.setOption = function(name, value) {
-        ImgCache.options[name] = value;
-    };
+        setOptions: function(options) {
+            angular.extend(this.options, options);
+        },
 
-    this.disableCache = function(value) {
-        ImgCache.options.cacheDisabled = value;
-    };
+        setOption: function(name, value) {
+            this.options[name] = value;
+        },
 
-    this.$get = ['$q', function($q) {
-        ImgCache.$deferred = $q.defer();
-        ImgCache.$promise = ImgCache.$deferred.promise;
+        disableCache: function(value) {
+            this.options.cacheDisabled = value;
+        },
 
-        if (!this.manualInit) {
-            ImgCache.$init();
-        }
+        retryCallbackProvider: function(name) {
+            this.options.retryCallbackProvider = name;
+        },
 
-        return ImgCache;
-    }];
+        $get: ['$q', '$injector', function($q, $injector) {
+            ImgCache.$deferred = $q.defer();
+            ImgCache.$promise = ImgCache.$deferred.promise;
+
+            if (!this.manualInit) {
+                ImgCache.$init();
+            }
+
+            return {
+                $init: function() {
+                    return ImgCache.$init();
+                },
+
+                ready: function() {
+                    return ImgCache.$promise;
+                },
+
+                retryCallback: function() {
+                    var providerName = ImgCache.options.retryCallbackProvider;
+                    return providerName && $injector.get(providerName) || null;
+                },
+
+                internal: function() {
+                    return ImgCache;
+                },
+
+                getCachedFileURL: function(src) {
+                    return $q(function(resolve, reject) {
+                        ImgCache.getCachedFileURL(src, function(src, dest) {
+                            resolve(dest);
+                        }, reject);
+                    });
+                },
+
+                /**
+                 * Resolves with no value if `src` is cached, otherwise rejects.
+                 */
+                isCached: function(src) {
+                    return $q(function(resolve, reject) {
+                        ImgCache.isCached(src, function(path, success) {
+                            if (success) { resolve(); } else { reject(); }
+                        });
+                    });
+                },
+
+                cacheFile: function(src) {
+                    return $q(function(resolve, reject) {
+                        ImgCache.cacheFile(src, resolve, reject);
+                    });
+                }
+            };
+        }]
+    });
 })
 
-.directive('imgCache', ['ImgCache', function() {
+.directive('imgCache', ['ImgCache', '$q', '$injector', function(ImgCache, $q, $injector) {
+    var retryCallback = ImgCache.retryCallback();
+    var pending = [];
+
+    function compareEntries(ref) {
+        return function(entry) {
+            return ref.scope === entry.scope && ref.el === entry.el;
+        };
+    }
+
     return {
         restrict: 'A',
         link: function(scope, el, attrs) {
-            var setImg = function(type, el, src) {
-                ImgCache.getCachedFileURL(src, function(src, dest) {
-                    if (type === 'bg') {
-                        el.css({'background-image': 'url(' + dest + ')'});
-                    } else {
-                        el.attr('src', dest);
-                    }
-                });
-            };
 
-            var fallbackImg = function(type, el, src) {
-                // fallback to original source if e.g. src is a relative
-                // file and therefore loaded from local file system
-                if (src) {
-                    if (type === 'bg') {
-                        el.css({'background-image': 'url(' + src + ')'});
-                    } else {
-                        el.attr('src', src);
-                    }
+            function retry(entry) {
+                // We're already tracking this entry
+                if (pending.filter(compareEntries(entry)).length) {
+                    return angular.noop;
                 }
-            };
+                pending.push(entry);
 
-            var loadImg = function(type, el, src) {
-                ImgCache.$promise.then(function() {
-                    ImgCache.isCached(src, function(path, success) {
-                        if (success) {
-                            setImg(type, el, src);
-                        } else {
-                            ImgCache.cacheFile(src, function() {
-                                setImg(type, el, src);
-                            }, function() {
-                                fallbackImg(type, el, src);
-                            });
-                        }
+                return function(src) {
+                    var results = pending.filter(function(entry) {
+                        return entry.src === src;
                     });
-                }, function() {
-                    fallbackImg(type, el, src);
-                });
+
+                    angular.forEach(results, function(entry) {
+                        loadImg(entry.type, entry.el)(src);
+                        pending.splice(pending.indexOf(entry), 1);
+                    });
+                };
+            }
+
+            function toStyle(url) {
+                return { 'background-image': 'url(' + url + ')' };
+            }
+
+            function applyImg(type, el, src) {
+                return (type === 'bg') ? el.css(toStyle(src)) : el.attr('src', src);
+            }
+
+            function setImg(type, el, src) {
+                ImgCache.getCachedFileURL(src)
+                    .then(function(dest) { applyImg(type, el, dest); });
+            }
+
+            var loadImg = function(type, el) {
+                return function(src) {
+                    if (!src) {
+                        return;
+                    }
+                    var fallback = function(err) {
+                        applyImg(type, el, src);
+                        if (retryCallback) {
+                            $q.when(retryCallback(src, err))
+                                .then(retry({ scope: scope, type: type, el: el, src: src }))
+                                .catch(function(alt) {
+                                    // remove the pending bad src
+                                    pending = pending.filter(function(entry) {
+                                        return entry.src != src;
+                                    });
+                                    // load the new url instead
+                                    retry({ scope: scope, type: type, el: el, src: alt })(alt);
+                                });
+                        }
+                    };
+
+                    return ImgCache.ready()
+                        .then(function() {
+                            return ImgCache.isCached(src)
+                                .then(function() { return setImg(type, el, src); })
+                                .catch(function() {
+                                    return ImgCache.cacheFile(src)
+                                        .then(function() { setImg(type, el, src); })
+                                        .catch(function(err) { fallback(err); });
+                                 });
+                        })
+                        .catch(fallback);
+                };
             };
 
-            attrs.$observe('icSrc', function(src) {
-                if (src) {
-                    loadImg('src', el, src);
-                }
-            });
+            attrs.$observe('icSrc', loadImg('src', el));
+            attrs.$observe('icBg', loadImg('bg', el));
 
-            attrs.$observe('icBg', function(src) {
-                if (src) {
-                    loadImg('bg', el, src);
-                }
+            scope.$on("$destroy", function() {
+                pending = pending.filter(function(entry) {
+                    return entry.scope !== scope;
+                });
             });
-
         }
     };
 }]);
